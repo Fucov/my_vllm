@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -32,6 +33,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.reset_metrics()
         atexit.register(self.exit)
 
     def exit(self):
@@ -44,14 +46,55 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        self._request_start_times[seq.seq_id] = perf_counter()
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def reset_metrics(self):
+        self.scheduler.reset_metrics()
+        self.model_runner.call("reset_metrics")
+        self._request_start_times = {}
+        self._first_token_seq_ids = set()
+        self._engine_metrics = {
+            "prefill_step_latencies": [],
+            "decode_step_latencies": [],
+            "ttft_latencies": [],
+            "completed_requests": 0,
+        }
+
+    def metrics(self):
+        cuda_metrics = {}
+        if torch.cuda.is_available():
+            cuda_metrics = {
+                "cuda_memory_allocated": torch.cuda.memory_allocated(),
+                "cuda_memory_reserved": torch.cuda.memory_reserved(),
+                "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(),
+                "cuda_max_memory_reserved": torch.cuda.max_memory_reserved(),
+            }
+        return {
+            "engine": self._engine_metrics,
+            "scheduler": self.scheduler.metrics,
+            "block_manager": self.scheduler.block_manager.metrics,
+            "model_runner": self.model_runner.metrics,
+            "cuda": cuda_metrics,
+        }
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        t = perf_counter()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        latency = perf_counter() - t
+        key = "prefill_step_latencies" if is_prefill else "decode_step_latencies"
+        self._engine_metrics[key].append(latency)
+        now = perf_counter()
+        for seq in seqs:
+            if seq.seq_id not in self._first_token_seq_ids and seq.num_completion_tokens > 0:
+                self._first_token_seq_ids.add(seq.seq_id)
+                self._engine_metrics["ttft_latencies"].append(now - self._request_start_times[seq.seq_id])
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        self._engine_metrics["completed_requests"] += len(outputs)
         return outputs, num_tokens
 
     def is_finished(self):

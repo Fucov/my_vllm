@@ -19,9 +19,11 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.max_seq_len_to_capture = config.max_seq_len_to_capture
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.reset_metrics()
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -57,6 +59,18 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
+
+    def reset_metrics(self):
+        self.metrics = {
+            "graph_replays": 0,
+            "graph_fallbacks": 0,
+            "graph_fallback_reasons": {},
+        }
+
+    def _record_graph_fallback(self, reason: str):
+        self.metrics["graph_fallbacks"] += 1
+        reasons = self.metrics["graph_fallback_reasons"]
+        reasons[reason] = reasons.get(reason, 0) + 1
 
     def loop(self):
         while True:
@@ -216,22 +230,39 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+        bs = input_ids.size(0)
+        context = get_context()
+        graph_bs = next((x for x in self.graph_bs if x >= bs), None) if not self.enforce_eager else None
+        fallback_reason = None
+        if self.enforce_eager:
+            fallback_reason = "enforce_eager"
+        elif graph_bs is None:
+            fallback_reason = "batch_too_large"
+        elif context.block_tables.size(1) > self.graph_vars["block_tables"].size(1):
+            fallback_reason = "block_table_too_wide"
+        elif int(context.context_lens.max().item()) > self.max_seq_len_to_capture:
+            fallback_reason = "context_too_long"
+
+        if fallback_reason is not None:
+            self._record_graph_fallback(fallback_reason)
+            return self.model.compute_logits(self.model(input_ids, positions))
+
+        graph = self.graphs[graph_bs]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"].fill_(-1)
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        self.metrics["graph_replays"] += 1
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -246,7 +277,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = (config.max_seq_len_to_capture + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)

@@ -25,12 +25,30 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, enable_prefix_late_merge: bool = False):
         self.block_size = block_size
+        self.enable_prefix_late_merge = enable_prefix_late_merge
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.reset_metrics()
+
+    def reset_metrics(self):
+        self.metrics = {
+            "allocations": 0,
+            "deallocations": 0,
+            "peak_used_blocks": len(self.used_block_ids),
+            "prefix_probes": 0,
+            "prefix_hits": 0,
+            "prefix_misses": 0,
+            "late_merge_attempts": 0,
+            "late_merge_successes": 0,
+            "late_merge_reclaimed_blocks": 0,
+        }
+
+    def _update_peak_used_blocks(self):
+        self.metrics["peak_used_blocks"] = max(self.metrics["peak_used_blocks"], len(self.used_block_ids))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -48,12 +66,15 @@ class BlockManager:
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
+        self.metrics["allocations"] += 1
+        self._update_peak_used_blocks()
         return block_id
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        self.metrics["deallocations"] += 1
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
@@ -62,9 +83,12 @@ class BlockManager:
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            self.metrics["prefix_probes"] += 1
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                self.metrics["prefix_misses"] += 1
                 break
+            self.metrics["prefix_hits"] += 1
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
@@ -117,4 +141,39 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            if self.enable_prefix_late_merge:
+                self._late_merge_block(seq, i, h, token_ids)
+            else:
+                self.hash_to_block_id[h] = block.block_id
+
+    def _late_merge_block(self, seq: Sequence, block_index: int, h: int, token_ids: list[int]):
+        block_id = seq.block_table[block_index]
+        canonical_id = self.hash_to_block_id.get(h, -1)
+        if canonical_id == -1:
+            self.hash_to_block_id[h] = block_id
+            return
+        self.metrics["late_merge_attempts"] += 1
+        if canonical_id == block_id:
+            return
+        canonical = self.blocks[canonical_id]
+        duplicate = self.blocks[block_id]
+        if canonical.token_ids != token_ids:
+            self.hash_to_block_id[h] = block_id
+            return
+        if canonical_id not in self.used_block_ids:
+            self.free_block_ids.remove(canonical_id)
+            self.used_block_ids.add(canonical_id)
+            canonical.ref_count = 0
+        seq.block_table[block_index] = canonical_id
+        canonical.ref_count += 1
+        duplicate.ref_count -= 1
+        self.metrics["late_merge_successes"] += 1
+        if duplicate.ref_count == 0:
+            self._deallocate_block(block_id)
+            self.metrics["late_merge_reclaimed_blocks"] += 1
+        self._assert_consistent()
+
+    def _assert_consistent(self):
+        used = {block.block_id for block in self.blocks if block.ref_count > 0}
+        assert used == self.used_block_ids
+        assert len(self.used_block_ids) + len(self.free_block_ids) == len(self.blocks)
