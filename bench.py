@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import copy
 import statistics
 import subprocess
 import time
@@ -124,34 +125,39 @@ def run_once(args: argparse.Namespace) -> dict:
         prefill_policy = "fair"
         enable_prefix_late_merge = True
 
-    llm = LLM(
-        model_path,
-        enforce_eager=args.enforce_eager,
-        max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=args.max_num_seqs,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        kvcache_block_size=args.kvcache_block_size,
-        prefill_policy=prefill_policy,
-        prefill_chunk_size=args.prefill_chunk_size,
-        enable_prefix_late_merge=enable_prefix_late_merge,
-        max_seq_len_to_capture=args.max_seq_len_to_capture,
-    )
-    llm.generate(["Benchmark warmup"], SamplingParams(ignore_eos=True, max_tokens=1), use_tqdm=False)
-    llm.reset_metrics()
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    llm = None
+    try:
+        llm = LLM(
+            model_path,
+            enforce_eager=args.enforce_eager,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            kvcache_block_size=args.kvcache_block_size,
+            prefill_policy=prefill_policy,
+            prefill_chunk_size=args.prefill_chunk_size,
+            enable_prefix_late_merge=enable_prefix_late_merge,
+            max_seq_len_to_capture=args.max_seq_len_to_capture,
+        )
+        llm.generate(["Benchmark warmup"], SamplingParams(ignore_eos=True, max_tokens=1), use_tqdm=False)
+        llm.reset_metrics()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
-    start = time.perf_counter()
-    for prompt, params in zip(prompts, sampling_params):
-        llm.add_request(prompt, params)
-    outputs = {}
-    while not llm.is_finished():
-        output, _ = llm.step()
-        for seq_id, token_ids in output:
-            outputs[seq_id] = token_ids
-    elapsed = time.perf_counter() - start
-    metrics = llm.metrics()
+        start = time.perf_counter()
+        for prompt, params in zip(prompts, sampling_params):
+            llm.add_request(prompt, params)
+        outputs = {}
+        while not llm.is_finished():
+            output, _ = llm.step()
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+        elapsed = time.perf_counter() - start
+        metrics = llm.metrics()
+    finally:
+        if llm is not None:
+            llm.exit()
 
     total_output_tokens = sum(len(tokens) for tokens in outputs.values())
     engine_metrics = metrics["engine"]
@@ -161,6 +167,8 @@ def run_once(args: argparse.Namespace) -> dict:
         "metadata": {
             "git_commit": git_commit(),
             "mode": args.mode,
+            "run_label": getattr(args, "run_label", args.mode),
+            "repeat_index": getattr(args, "repeat_index", 0),
             "workload": args.workload,
             "seed": args.seed,
             "model": model_path,
@@ -191,6 +199,98 @@ def run_once(args: argparse.Namespace) -> dict:
     return summary
 
 
+def variant_args(args: argparse.Namespace, label: str, seed: int, repeat_index: int) -> argparse.Namespace:
+    variant = copy.copy(args)
+    variant.seed = seed
+    variant.repeat_index = repeat_index
+    variant.run_label = label
+    variant.mode = "baseline"
+    variant.prefill_policy = "fcfs"
+    variant.enable_prefix_late_merge = False
+    if label == "fair":
+        variant.prefill_policy = "fair"
+    elif label == "late_merge":
+        variant.enable_prefix_late_merge = True
+    elif label == "optimized":
+        variant.mode = "optimized"
+        variant.prefill_policy = "fair"
+        variant.enable_prefix_late_merge = True
+    elif label != "baseline":
+        raise ValueError(f"unknown matrix label: {label}")
+    return variant
+
+
+def metric_path(result: dict, path: str) -> float:
+    value = result
+    for part in path.split("."):
+        value = value[part]
+    return float(value)
+
+
+def summarize_results(results: list[dict]) -> dict:
+    metric_paths = {
+        "throughput_tok_s": "summary.throughput_tok_s",
+        "ttft_p50_s": "summary.ttft_s.p50",
+        "ttft_p95_s": "summary.ttft_s.p95",
+        "ttft_p99_s": "summary.ttft_s.p99",
+        "prefill_mean_s": "summary.prefill_step_s.mean",
+        "decode_p95_s": "summary.decode_step_s.p95",
+        "peak_used_blocks": "metrics.block_manager.peak_used_blocks",
+        "prefix_hits": "metrics.block_manager.prefix_hits",
+        "prefix_misses": "metrics.block_manager.prefix_misses",
+        "late_merge_successes": "metrics.block_manager.late_merge_successes",
+        "late_merge_reclaimed_blocks": "metrics.block_manager.late_merge_reclaimed_blocks",
+        "graph_replays": "metrics.model_runner.graph_replays",
+        "graph_fallbacks": "metrics.model_runner.graph_fallbacks",
+    }
+    grouped: dict[str, list[dict]] = {}
+    for result in results:
+        label = result["metadata"].get("run_label", result["metadata"]["mode"])
+        grouped.setdefault(label, []).append(result)
+
+    summary = {}
+    for label, items in grouped.items():
+        label_summary = {"runs": len(items)}
+        for name, path in metric_paths.items():
+            values = [metric_path(item, path) for item in items]
+            label_summary[name] = {
+                "mean": statistics.fmean(values),
+                "median": statistics.median(values),
+                "min": min(values),
+                "max": max(values),
+                "std": statistics.stdev(values) if len(values) > 1 else 0.0,
+            }
+        summary[label] = label_summary
+    return summary
+
+
+def run_repeated(args: argparse.Namespace) -> list[dict]:
+    labels = ("baseline", "fair", "late_merge", "optimized") if args.matrix else (getattr(args, "run_label", args.mode),)
+    results = []
+    jsonl_file = None
+    if args.output_jsonl:
+        os.makedirs(os.path.dirname(args.output_jsonl) or ".", exist_ok=True)
+        jsonl_file = open(args.output_jsonl, "w")
+    try:
+        for repeat_index in range(args.repeat):
+            seed = args.seed + repeat_index
+            for label in labels:
+                run_args = variant_args(args, label, seed, repeat_index) if args.matrix else copy.copy(args)
+                if not args.matrix:
+                    run_args.seed = seed
+                    run_args.repeat_index = repeat_index
+                    run_args.run_label = label
+                result = run_once(run_args)
+                results.append(result)
+                if jsonl_file is not None:
+                    jsonl_file.write(json.dumps(result, sort_keys=True) + "\n")
+                    jsonl_file.flush()
+    finally:
+        if jsonl_file is not None:
+            jsonl_file.close()
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="nano-vLLM benchmark with reproducible workloads and runtime metrics.")
     parser.add_argument("--model", default="~/models/Qwen3-0.6B/")
@@ -215,13 +315,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-prefix-late-merge", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--max-seq-len-to-capture", type=int, default=None)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--matrix", action="store_true")
+    parser.add_argument("--output-jsonl", default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    summary = run_once(args)
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.repeat < 1:
+        raise ValueError("--repeat must be >= 1")
+    results = run_repeated(args)
+    if len(results) == 1 and not args.matrix:
+        print(json.dumps(results[0], indent=2, sort_keys=True))
+        return
+    output = {
+        "metadata": {
+            "workload": args.workload,
+            "repeat": args.repeat,
+            "matrix": args.matrix,
+            "output_jsonl": args.output_jsonl,
+            "seed_start": args.seed,
+            "num_seqs": args.num_seqs,
+            "model": os.path.expanduser(args.model),
+            "git_commit": git_commit(),
+        },
+        "summary": summarize_results(results),
+    }
+    print(json.dumps(output, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
