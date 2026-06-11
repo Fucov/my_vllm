@@ -37,6 +37,13 @@ class BenchCliTest(unittest.TestCase):
         self.assertEqual(args.repeat, 5)
         self.assertEqual(args.output_jsonl, "logs/trick1_shared_matrix.jsonl")
 
+    def test_single_run_json_flag_parse(self):
+        bench = self.import_bench_with_stubs()
+        argv = ["bench.py", "--single-run-json"]
+        with patch.object(sys, "argv", argv):
+            args = bench.parse_args()
+        self.assertTrue(args.single_run_json)
+
 
 if __name__ == "__main__":
     unittest.main()

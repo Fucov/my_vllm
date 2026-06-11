@@ -3,6 +3,7 @@ import json
 import os
 import random
 import copy
+import sys
 import statistics
 import subprocess
 import time
@@ -291,6 +292,84 @@ def run_repeated(args: argparse.Namespace) -> list[dict]:
     return results
 
 
+def build_child_command(args: argparse.Namespace, label: str, seed: int, repeat_index: int) -> list[str]:
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--single-run-json",
+        "--model", args.model,
+        "--mode", "baseline",
+        "--workload", args.workload,
+        "--seed", str(seed),
+        "--num-seqs", str(args.num_seqs),
+        "--vocab-size", str(args.vocab_size),
+        "--min-input-len", str(args.min_input_len),
+        "--max-input-len", str(args.max_input_len),
+        "--min-output-len", str(args.min_output_len),
+        "--max-output-len", str(args.max_output_len),
+        "--shared-prefix-len", str(args.shared_prefix_len),
+        "--temperature", str(args.temperature),
+        "--max-model-len", str(args.max_model_len),
+        "--max-num-batched-tokens", str(args.max_num_batched_tokens),
+        "--max-num-seqs", str(args.max_num_seqs),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--kvcache-block-size", str(args.kvcache_block_size),
+        "--prefill-chunk-size", str(args.prefill_chunk_size),
+        "--run-label", label,
+        "--repeat-index", str(repeat_index),
+    ]
+    if args.max_seq_len_to_capture is not None:
+        cmd.extend(["--max-seq-len-to-capture", str(args.max_seq_len_to_capture)])
+    if args.enforce_eager:
+        cmd.append("--enforce-eager")
+    if label == "fair":
+        cmd.extend(["--prefill-policy", "fair"])
+    elif label == "late_merge":
+        cmd.append("--enable-prefix-late-merge")
+    elif label == "optimized":
+        cmd.extend(["--mode", "optimized"])
+    else:
+        cmd.extend(["--prefill-policy", "fcfs"])
+    return cmd
+
+
+def run_child_command(cmd: list[str]) -> dict:
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        if completed.stdout:
+            print(completed.stdout, file=sys.stderr)
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr)
+        raise RuntimeError(f"child benchmark failed with exit code {completed.returncode}")
+    text = completed.stdout
+    start = text.find("{")
+    if start == -1:
+        raise RuntimeError("child benchmark did not print JSON")
+    return json.loads(text[start:])
+
+
+def run_repeated_isolated(args: argparse.Namespace) -> list[dict]:
+    labels = ("baseline", "fair", "late_merge", "optimized") if args.matrix else (args.run_label,)
+    results = []
+    jsonl_file = None
+    if args.output_jsonl:
+        os.makedirs(os.path.dirname(args.output_jsonl) or ".", exist_ok=True)
+        jsonl_file = open(args.output_jsonl, "w")
+    try:
+        for repeat_index in range(args.repeat):
+            seed = args.seed + repeat_index
+            for label in labels:
+                result = run_child_command(build_child_command(args, label, seed, repeat_index))
+                results.append(result)
+                if jsonl_file is not None:
+                    jsonl_file.write(json.dumps(result, sort_keys=True) + "\n")
+                    jsonl_file.flush()
+    finally:
+        if jsonl_file is not None:
+            jsonl_file.close()
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="nano-vLLM benchmark with reproducible workloads and runtime metrics.")
     parser.add_argument("--model", default="~/models/Qwen3-0.6B/")
@@ -318,6 +397,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--matrix", action="store_true")
     parser.add_argument("--output-jsonl", default=None)
+    parser.add_argument("--single-run-json", action="store_true")
+    parser.add_argument("--run-label", default=None)
+    parser.add_argument("--repeat-index", type=int, default=0)
     return parser.parse_args()
 
 
@@ -325,7 +407,12 @@ def main():
     args = parse_args()
     if args.repeat < 1:
         raise ValueError("--repeat must be >= 1")
-    results = run_repeated(args)
+    if args.run_label is None:
+        args.run_label = args.mode
+    if args.single_run_json:
+        print(json.dumps(run_once(args), indent=2, sort_keys=True))
+        return
+    results = run_repeated_isolated(args) if args.matrix or args.repeat > 1 or args.output_jsonl else run_repeated(args)
     if len(results) == 1 and not args.matrix:
         print(json.dumps(results[0], indent=2, sort_keys=True))
         return
