@@ -57,6 +57,9 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        # can_allocate 的意思是判断 seq 还需要分配多少个新的 KV Cache 块才能把它剩余的 token 全部覆盖到 KV Cache 里, 
+        # 同时在这个过程中尽可能地重用已经分配过的块来减少新的块的分配数量, 从而提高 KV Cache 的利用率和调度效率。
+        # 它返回一个整数，表示 seq 还需要分配多少个新的块，如果返回 -1 就表示即使不考虑块重用，seq 也无法被完全覆盖到 KV Cache 里了。
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks # 需要分配的新块数, 初始值是 seq 的 KV 块数, 后续会根据块重用的情况进行调整

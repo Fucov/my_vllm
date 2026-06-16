@@ -82,6 +82,9 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        # call 的意思是当 rank 0 的进程调用 model_runner.call("method_name", *args) 时, 它会先把 method_name 和 args 写入 shared memory, 
+        # 然后通过 event 通知其他 rank 的进程来执行这个方法; 当其他 rank 的进程接收到通知时, 它们会从 shared memory 里读出 method_name 和 args, 
+        # 然后调用相应的方法来执行。这个 call 函数在 LLMEngine 里被用来让 rank 0 的进程调用 ModelRunner 里定义的各种方法, 比如 run_model、prepare_prefill、prepare_decode 等等。
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
