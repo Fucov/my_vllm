@@ -45,8 +45,16 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
+            """
+            num_cached_tokens: 进入本step之前，已经写入KV Cache的Token数
+            num_scheduled_tokens: 本step计划写入KV Cache的Token数
+            num_tokens: 进入本step之前，尚未写入KV Cache的Token数
+                - 如果 num_cached_tokens + num_scheduled_tokens == seq.num_tokens，说明本step计划写入KV Cache的Token数足以覆盖剩余的所有Token，
+                    可以把status 设为 SequenceStatus.RUNNING，seq就可以切到 decode 队列了
+                - prefill阶段, nums_tokens就是prompt长度（还没append过任何decode token）
+            """
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:  
+                seq.status = SequenceStatus.RUNNING # 切到 decode 队列
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
@@ -84,7 +92,7 @@ class Scheduler:
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                continue
+                continue # prefill阶段还没覆盖所有token，继续prefill
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
