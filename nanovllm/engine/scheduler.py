@@ -46,7 +46,7 @@ class Scheduler:
                 break
             if not seq.block_table: 
                 # 如果这个 seq 还没有分配过 KV Cache 块, 就先调用 block_manager.can_allocate(seq) 来看看它还能分配多少块 KV Cache 块, 从而计算出它还能写入多少个 token 到 KV Cache 里。
-                # 这个数量是一个 upper bound, 实际能写入的 token 数还要看 seq.num_tokens - seq.num_cached_tokens 的值。
+                # 这个数量是一个 upper bound（先给整个seq分配空间，可能一次无法填充完）, 实际能写入的 token 数还要看 seq.num_tokens - seq.num_cached_tokens 的值。
                 num_cached_blocks = self.block_manager.can_allocate(seq)
 
                 if num_cached_blocks == -1: 
@@ -59,7 +59,7 @@ class Scheduler:
                 # 如果这个 seq 已经分配过 KV Cache 块了, 就直接用 seq.num_tokens - seq.num_cached_tokens 来计算它还需要写入 KV Cache 的 token 数量。
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             if remaining < num_tokens and scheduled_seqs:  
-                # 如果这个 seq 还需要写入 KV Cache 的 token 数量超过了本步剩余的 token 预算了, 就直接 break, 不再考虑后面的 seq 了。
+                # 如果这个 seq 还需要写入 KV Cache 的 token 数量超过了本步剩余的 token 预算了,同时不是队首（不是前几个Token序列）, 就直接 break, 不再考虑后面的 seq 了。
                 break
             # 下面是 prefill 真正分配，上面只是预估这个 seq 还需要写入 KV Cache 的 token 数量来判断它是否能被调度。
             if not seq.block_table:
