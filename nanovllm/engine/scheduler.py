@@ -38,7 +38,12 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
-
+    """
+    修改后行为：
+    1. waiting 非空且 prefill_policy == "fair" 时调用 _schedule_fair_prefill()
+    2. waiting 非空且 policy 为 fcfs 时调用 _schedule_fcfs()
+    3. waiting 为空时调用 _schedule_decode()
+    """
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.prefill_policy == "fair":
             scheduled = self._schedule_fair_prefill()
@@ -85,7 +90,15 @@ class Scheduler:
             return scheduled_seqs, True
 
         return self._schedule_decode()
-
+    """
+    关键逻辑：
+    1. 扫描 waiting 队列一轮；
+    2. 如 sequence 尚未分配 block，则先调用 block_manager.can_allocate() 和 allocate()；
+    3. remaining_budget = max_num_batched_tokens - scheduled_tokens；
+    4. chunk_tokens = min(seq.num_tokens - seq.num_scheduled_tokens, prefill_chunk_size, remaining_budget)；
+    5. chunk 未完成则重新放回 waiting；
+    6. prompt prefill 完成后将 seq 状态改为 RUNNING 并进入 running 队列。
+    """
     def _schedule_fair_prefill(self) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = 0

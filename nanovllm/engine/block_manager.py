@@ -145,7 +145,17 @@ class BlockManager:
                 self._late_merge_block(seq, i, h, token_ids)
             else:
                 self.hash_to_block_id[h] = block.block_id
-
+    """
+    行为：
+    1. 查询 canonical block；
+    2. 如果 canonical 与当前 block 不是同一个，且 token_ids 完全相同，则允许合并；
+    3. 将 seq.block_table[block_index] 重定向到 canonical_id；
+    4. canonical.ref_count += 1；
+    5. duplicate.ref_count -= 1；
+    6. duplicate.ref_count == 0 时回收 duplicate physical block；
+    7. 统计 late_merge_successes 和 reclaimed_blocks；
+    8. 调用 _assert_consistent() 做 ref_count 非负检查。
+    """
     def _late_merge_block(self, seq: Sequence, block_index: int, h: int, token_ids: list[int]):
         block_id = seq.block_table[block_index]
         canonical_id = self.hash_to_block_id.get(h, -1)

@@ -12,7 +12,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    prefill_policy: str = "fcfs"
+    prefill_policy: str = "fcfs" #prefill策略
     prefill_chunk_size: int = 1024
     enable_prefix_late_merge: bool = False
     max_seq_len_to_capture: int | None = None

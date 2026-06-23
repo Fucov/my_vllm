@@ -228,6 +228,16 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    """
+    关键逻辑：
+    1. prefill 一律 eager，统计 eager_prefill_runs；
+    2. decode 如果 enforce_eager，则 eager fallback；
+    3. 如果 batch size 没有 captured graph，则 fallback；
+    4. 如果 runtime block_tables 宽度超过 graph buffer 宽度，则 fallback；
+    5. 如果 context_lens 最大值超过 max_seq_len_to_capture，则 fallback；
+    6. 否则清理 graph_vars 缓冲区并 replay graph；
+    7. 统计 graph_replays、graph_fallbacks、graph_fallback_reasons。
+    """
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill:
@@ -271,7 +281,12 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
-
+    """
+    关键逻辑：
+    1. max_num_blocks 基于 max_seq_len_to_capture 计算；
+    2. 预捕获 batch size [1, 2, 4, 8] 和 16 间隔 bucket；
+    3. 每个 graph bucket 维护 input_ids、positions、slot_mapping、context_lens、block_tables 等 graph_vars。
+    """
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config

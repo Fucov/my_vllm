@@ -43,7 +43,7 @@ def git_commit() -> str:
     except Exception:
         return "unknown"
 
-
+# 随机 prompt 长度和输出长度
 def make_random_workload(args: argparse.Namespace) -> tuple[list[list[int]], list[SamplingParams]]:
     prompts = [
         [random.randint(0, args.vocab_size - 1) for _ in range(random.randint(args.min_input_len, args.max_input_len))]
@@ -55,7 +55,7 @@ def make_random_workload(args: argparse.Namespace) -> tuple[list[list[int]], lis
     ]
     return prompts, sampling_params
 
-
+# 60% short、30% medium、10% long 的混合长度 prompt
 def make_mixed_lengths_workload(args: argparse.Namespace) -> tuple[list[list[int]], list[SamplingParams]]:
     prompts = []
     short_count = int(args.num_seqs * 0.6)
@@ -77,7 +77,7 @@ def make_mixed_lengths_workload(args: argparse.Namespace) -> tuple[list[list[int
     ]
     return prompts, sampling_params
 
-
+# 多请求共享固定 prefix，再拼接随机 suffix
 def make_shared_prefix_workload(args: argparse.Namespace) -> tuple[list[list[int]], list[SamplingParams]]:
     prefix_len = min(args.shared_prefix_len, args.max_model_len - 2)
     suffix_max = max(1, min(args.max_input_len - prefix_len, args.max_model_len - prefix_len - 1))
@@ -113,7 +113,7 @@ def length_summary(values: list[int]) -> dict[str, float]:
         "p95": percentile([float(v) for v in values], 95),
     }
 
-
+# warmup、reset metrics、加入所有请求、循环 step，输出 JSON summary
 def run_once(args: argparse.Namespace) -> dict:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -227,7 +227,7 @@ def metric_path(result: dict, path: str) -> float:
         value = value[part]
     return float(value)
 
-
+# 聚合 throughput、TTFT、prefill/decode、KV block、prefix、graph 指标
 def summarize_results(results: list[dict]) -> dict:
     metric_paths = {
         "throughput_tok_s": "summary.throughput_tok_s",
@@ -369,7 +369,7 @@ def run_repeated_isolated(args: argparse.Namespace) -> list[dict]:
             jsonl_file.close()
     return results
 
-
+# 增加 workload、matrix、repeat、output-jsonl、prefill policy、late merge 等 CLI 参数
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="nano-vLLM benchmark with reproducible workloads and runtime metrics.")
     parser.add_argument("--model", default="~/models/Qwen3-0.6B/")
